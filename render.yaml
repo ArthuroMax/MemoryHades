@@ -1,0 +1,18 @@
+# UNTESTED template for option A (paid web service + persistent disk). Verify against Render's Blueprint spec before use.
+services:
+  - type: web
+    name: coinfarm-nav-memory
+    runtime: python
+    plan: starter            # a paid plan: persistent disks are not available on free instances
+    buildCommand: python --version
+    startCommand: python server.py
+    healthCheckPath: /healthz
+    disk:
+      name: nav-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NAV_DB_PATH
+        value: /var/data/nav.sqlite3
+      - key: NAV_TOKENS
+        sync: false          # set in the dashboard, never commit it
