@@ -1,87 +1,96 @@
-# Navigation-memory service (reference implementation)
+# Navigation-memory service v2 — Pastefy storage
 
-Status: **implemented and tested locally (SQLite). Not deployed.** Python standard library only, no dependencies.
-Sections: 1 limits of Render / UptimeRobot, 2 architecture, 3 API, 4 schema, 5 learning rules, 6 security + privacy, 7 deploying, 8 what is NOT done.
+Status: **implemented and tested against a SIMULATED Pastefy and a SIMULATED Roblox/Render environment. Not deployed. Never run against the real Pastefy API, never run in Roblox.**
+Python standard library only. See §9 for exactly what was and was not tested.
 
-## 1. What Render and UptimeRobot can and cannot do  (checked against their documentation, Oct 2026 - re-check before relying on it)
+## 1. What changed
+SQLite is gone. The service keeps one versioned JSON document in memory and persists it to **one designated Pastefy paste** (`GET`/`PUT https://pastefy.app/api/v2/paste/{id}`, `Authorization: Bearer <token>` — checked against docs.pastefy.app; PUT returns 204). It never creates pastes. Because storage is external, **no persistent disk and no paid Render plan are required**.
 
-**Render, free web service**
-- Spins down after **15 minutes without inbound traffic**; the next request waits for a cold start (tens of seconds up to about a minute).
-- The **local filesystem is ephemeral**: anything written to it - including a SQLite file - is lost on spin-down, restart and redeploy.
-  Render may also restart a free service at any time.
-- 750 free instance-hours per workspace per month (one always-on service uses about 720-744 of them).
-- **No persistent disk** on free instances (disks attach to paid web services only, billed per GB-month).
-
-**Render Postgres, free**: expires **30 days after creation** (short grace period, then it is gone). Paid Postgres is the durable option.
-
-**UptimeRobot, free plan**: 50 monitors, 5-minute interval (check the current terms for commercial-use wording). It **monitors and alerts**; it cannot make a service
-available. A 5-minute HTTP check does generate inbound traffic, so it will in practice keep a free Render service from spinning down - but that
-spends the instance-hours, does not stop restarts, and does not make a SQLite file durable. Treat it as a **monitor**, not as a keep-alive guarantee.
-
-**Consequence for the design**
-1. The script must work with no server at all. It does: memory is local first (a file written by the executor) and the server is optional.
-2. A free Render web service + SQLite loses everything on each restart. Do not use that combination for data you want to keep.
-3. Durable options (pick one):
-   - **A. Paid Render web service + persistent disk** with `NAV_DB_PATH=/var/data/nav.sqlite3` - works with the code exactly as written (single instance only).
-   - **B. Render web service + a managed Postgres** (paid Render Postgres, or an external provider). Needs a Postgres storage adapter, **which is not written**
-     (`schema.postgres.sql` is the target schema).
-   - **C. Free service as a best-effort sync target only**: tolerate data loss; the clients re-upload their local memory on the next sync anyway.
-
-## 2. Architecture
-
+## 2. Architecture and the offline guarantee
 ```
- Roblox executor (script)                          Render web service                      UptimeRobot
- ┌──────────────────────────┐   HTTPS + Bearer     ┌─────────────────────────┐   GET /healthz   ┌───────────┐
- │ CoinFarm.mem (local first)│ ── POST observations ▶ │ server.py (validate,    │ ◀─────────────── │ 5-min HTTP │
- │  - decayed counts per cell│ ◀─ GET advice ────── │  aggregate, advise)      │   200 / 503      │ monitor    │
- │  - JSON file via writefile│                      │  SQLite on persistent disk│ ───── alert ───▶ └───────────┘
- │  - offline queue, backoff │                      └─────────────────────────┘
- └──────────────────────────┘
+ Roblox script (local-first)                Render service (this repo)                  Pastefy
+ ┌──────────────────────────────┐  HTTPS   ┌───────────────────────────────┐  HTTPS   ┌─────────────────┐
+ │ local file: own cells, unsent │ ───────▶ │ in-memory document (cache)     │ ───────▶ │ ONE paste (JSON) │
+ │ queue, cached server advice   │ ◀─────── │ batched write, read-merge-write│ ◀─────── │ revisioned doc   │
+ │ never needs the service       │ own token│ holds the Pastefy token        │ API token└─────────────────┘
+ └──────────────────────────────┘          └───────────────────────────────┘
 ```
-- The client never blocks navigation on the network: one request in flight, 20 s watchdog, exponential back-off (30 s .. 10 min), queue capped at 200.
-- The server never sends code. Advice is a fixed-shape list of numbers and enum strings; the client re-validates every field and ignores anything else.
-
-## 3. API  (all JSON, `schema_version` = 1)
-| | |
+| Situation | Behaviour |
 |---|---|
-| `GET /healthz` | no auth; `200 {"ok":true,"schema":1,"db":"ok"}` or `503` - this is what UptimeRobot polls |
-| `POST /v1/observations` | `Authorization: Bearer <token>`; `{"schema_version":1,"observations":[1..50 x obs]}` -> `{"accepted":n}`; 400 malformed, 401/403 auth, 413 > 64 KiB, 422 validation / unsupported version, 429 rate limit |
-| `GET /v1/maps/<map_id>/advice` | Bearer; `{"schema_version":1,"server_time":..,"map":..,"records":[{kind,x,y,z,state,confidence,observations,sources,last_seen,expires}]}` (max 500) |
+| Render up, Pastefy up | script pushes observations (batched, idempotent), pulls advice per map (cached 10 min); service flushes to Pastefy every ≤90 s |
+| **Render asleep / down** | script keeps playing from its **local file** (own cells + the last advice it downloaded, each record valid until its own expiry). Only a tokenless `GET /healthz` wake-up probe is sent, with exponential back-off 30 s → 10 min. Nothing local is ever deleted by a failed sync |
+| Render comes back | the next probe succeeds, the persisted queue is delivered (same batch id on retries → no double counting), advice is refreshed |
+| Pastefy down / rate limited / 5xx | service keeps serving from memory, stays dirty, retries with back-off (honours `Retry-After`); `/healthz` stays 200 and says `degraded` |
+| Render restarts while Pastefy is down | service refuses uploads/advice with 503 until the document is loaded; clients keep queueing locally. **It never writes before it has loaded.** |
 
-Observation: `v, map, sig, kind(hop|route|stuck|escape|coin), x,y,z, outcome(success|fail|abandon|unsafe), reason, nav, recovery, escape(bool), t` -
-map id and size signature, the 4-stud cell, traversal class, outcome and reason, navigation state, recovery action attempted, whether an escape destination was reached, timestamp.
-Strings are limited to `[A-Za-z0-9 _.\-:()]{0,32}`; coordinates to +-5000; non-finite numbers are rejected; unknown fields are ignored and not stored.
+**Limits, stated plainly.** A sleeping Render service cannot proxy anything, so while it sleeps the script cannot reach Pastefy *through* it. Observations the service has accepted but not yet flushed (≤ one flush interval, longer during a Pastefy outage) are lost if Render is killed in that window; the clients' own local memory is unaffected. On a free plan the first request after sleep takes tens of seconds (the script never blocks on it).
 
-## 4. Schema (SQLite as implemented; Postgres equivalent in `schema.postgres.sql`)
-`schema_migrations(version, applied_at)` - applied in order, idempotent, never edited after release.
-`nav_records(schema_version, map_id, kind, cell_x, cell_z, y, successes, failures, abandons, unsafe, obs_count, last_reason, map_sig, first_seen, last_seen, last_unsafe)` unique per (map, kind, cell).
-`record_sources(record_id, source_hash)` - distinct contributors (first 16 hex of SHA-256 of the token). `nav_observations` - bounded raw log (20 000 rows).
-Every row carries `schema_version`; advice ignores rows below `MIN_SUPPORTED`, so a future script/schema can coexist with old rows until a migration upgrades them.
+### Why the client does not talk to Pastefy directly
+Pastefy only offers Bearer API tokens. Anything inside a Roblox script can be extracted by whoever has the script, and I could not verify that Pastefy tokens can be scoped (e.g. to one paste or to write-only) — so a token in the client would let anyone overwrite or read your account's pastes. That is why the token lives only in Render's environment. If you ever want Render-independent sync, the safe options are: (a) a read-only copy of the memory in a **public/unlisted paste** fetched without a token (read-only, but then the memory is public; I did not implement it), or (b) a second tiny always-on proxy. I did not implement either.
 
-## 5. Learning rules (identical in `server.py` and the Lua `Mem.stateOf`)
-Per record: counts decay with a 14-day half-life; a **contradicting** observation halves the opposing history; a changed **map signature** multiplies everything by 0.25.
+## 3. Configuration (Render → Environment)
+| Variable | Required | Meaning |
+|---|---|---|
+| `PASTEFY_API_TOKEN` | yes | token from <https://pastefy.app/apikeys>. Never in code, never logged, never returned |
+| `PASTEFY_PASTE_ID` | yes | id of the designated paste. Create it **once** by hand (content `{}` is fine, visibility **PRIVATE**) |
+| `NAV_TOKENS` / `NAV_TOKEN_HASHES` | yes | secrets the Lua script sends as *Memory token* (hashes: `sha256` hex, comma separated) |
+| `PASTEFY_API_BASE` | no | default `https://pastefy.app/api/v2` (must be https; http only for localhost tests) |
+| `PASTEFY_FLUSH_SECONDS` | no | batch interval for writes, default 90 |
+| `PASTEFY_CACHE_SECONDS` | no | background refresh age (merge in changes from elsewhere), default 300 |
+| `PASTEFY_MAX_BYTES` | no | document size cap, default 600000 (Pastefy documents no limit; older low-value cells are pruned first) |
+| `PASTEFY_ADOPT_PASTE` | no | `1` = allow overwriting a paste whose content is not ours. Off by default (protects against a wrong id) |
+| `NAV_MIN_SOURCES` | no | distinct contributors needed before a state is advised (default 1; use ≥ 2 for a public deployment) |
+Without the two `PASTEFY_*` variables the service still starts but is **VOLATILE** (memory lost on restart); `/healthz` says so.
+
+## 4. Document stored in the paste (`doc_version` 1)
+```json
+{"format":"coinfarm-navmemory","doc_version":1,"memory_id":"<random>","revision":17,"updated_at":1700000000,
+ "maps":{"<placeId>:<map>":{"sig":"100x50x100","ts":1700000000,
+   "cells":{"<kind>|<cx>|<cz>":{"s":3,"f":0,"a":0,"u":0,"n":3,"t0":..,"t1":..,"y":3.0,"lu":..,"why":"stuck","src":["1a2b3c4d"]}}}},
+ "recent_batches":["<batch id>", "..."]}
+```
+Kinds: `hop` (jump/platform hops), `route`, `stuck`, `escape` (learned escape destinations), `coin` (coin locations). `sig` is the map-size signature (map information). 4-stud cells; `s/f/a/u` are decayed success/fail/abandon/unsafe counts; `src` are 8-hex hashes of contributor tokens (never the token). A newer `doc_version` than this code knows puts the service in **read-only** mode (it will not touch the paste). Add a function to `MIGRATIONS` before raising `DOC_VERSION`.
+
+## 5. Learning rules (unchanged from v1; identical in `server.py` and the Lua `Mem.stateOf`)
+14-day half-life decay; a contradicting observation halves the opposing history; **a changed map signature multiplies everything remembered for that map by 0.25** (v1 applied it per touched row; it is now per map, matching what the Lua client already did — a client whose signature flips back and forth would weaken a map repeatedly, as before).
 | state | needs | lasts |
 |---|---|---|
-| `unreachable` | >= 2.5 (decayed) abandons, ~no success | 6 h, then the spot is **retested** |
-| `unreliable` | >= 2.5 failures and confidence <= 0.3 | 24 h, then retested |
-| `candidate` | >= 2.5 successes and confidence >= 0.75 | 7 days |
-| `invalid` (escape destination) | any `unsafe` | 30 min, then it must **re-earn** trust |
-Confidence = (s+1)/(s+f+2). `NAV_MIN_SOURCES` (default 1) can require several independent tokens before a state is advised.
-Nothing is a permanent blacklist and nothing is "last result wins".
+| `unreachable` | ≥ 2.5 abandons, ~no success | 6 h, then retested |
+| `unreliable` | ≥ 2.5 failures and confidence ≤ 0.3 | 24 h |
+| `candidate` | ≥ 2.5 successes and confidence ≥ 0.75 | 7 days |
+| `invalid` (escape) | any `unsafe` | 30 min, then must be re-earned |
 
-## 6. Security and privacy
-Bearer tokens over HTTPS; only SHA-256 hashes are configured; constant-time comparison; per-token rate limit (120/min); 64 KiB body and 50-item batch limits;
-the service refuses to start without a token. No IP addresses (request logging is off), no player ids, names or accounts are read or stored.
-A token embedded in a client script can be extracted by whoever has the script: it keeps strangers out, it does not make an untrusted client trustworthy -
-hence validation, ranges, rate limits and (for a public deployment) `NAV_MIN_SOURCES >= 2`.
+## 6. Safety rules for the stored memory
+- **Load before write.** Nothing is written until the paste has been read and validated.
+- **Empty paste**: initialised only after *two* empty answers (one blank could be a glitch over real data).
+- **Corrupt / HTML / truncated / foreign / newer-version / missing-`content` answers** are never merged and never trigger a write; a mostly-invalid document (>10 % bad cells) counts as corrupt; a few bad cells are dropped individually.
+- If the paste *becomes* empty/corrupt after we loaded valid memory, it is restored from our valid copy only after **3 consecutive bad checks**; foreign JSON (probably the wrong paste id) is never overwritten unless `PASTEFY_ADOPT_PASTE=1`.
+- **Read-merge-write**: every flush re-reads the paste and merges it (newest cell wins) so two instances (overlapping deploys) do not erase each other; the written text is re-parsed and size-checked first; the write is read back to verify.
+- Redirects are not followed (the Authorization header could leak); errors never contain the token.
+- Ingest is idempotent per `batch_id`. Validation, ranges, 64 KiB bodies, 50 observations per batch and per-token rate limits are as in v1.
 
-## 7. Deploying (option A)
-1. Create a Render **web service** (paid instance) from this folder, runtime Python, start command `python server.py`, health check path `/healthz`.
-2. Attach a **persistent disk** mounted at `/var/data`; set `NAV_DB_PATH=/var/data/nav.sqlite3`.
-3. Set `NAV_TOKENS` (comma separated secrets; generate with `python -c "import secrets;print(secrets.token_urlsafe(32))"`). Keep to **one instance** (SQLite + one disk).
-4. UptimeRobot: HTTP(s) monitor on `https://<service>.onrender.com/healthz`, 5-minute interval, alert contact of your choice.
-5. In the script's Farm tab set *Memory server URL* and *Memory token*. Empty = local memory only.
-`render.yaml` is an **untested template** for the above - verify it against Render's Blueprint documentation.
+## 7. API
+`GET /healthz` (no auth; always 200 while the process runs — a failing health check would make Render restart the service; look at `storage.state`: `synced|pending|degraded|loading|blocked|readonly|volatile`, `warnings` e.g. `paste_is_public`).
+`POST /v1/observations` and `GET /v1/maps/<id>/advice` as before (`schema_version` 1). New: optional `batch_id` on POST; `revision` + `memory_id` in advice; `503 {"retry":true}` while the memory is not available (the client keeps its queue).
 
-## 8. Not done
-Postgres adapter; deployment (no account / network access here); load testing; token rotation tooling; an admin view of the data.
+## 8. Deploying to the existing service
+1. On Pastefy create one paste (content `{}`, visibility PRIVATE) and an API key; note the paste id.
+2. Render dashboard → *memoryhades* → Environment: set `PASTEFY_API_TOKEN`, `PASTEFY_PASTE_ID`, `NAV_TOKENS`.
+3. Deploy `server.py` (start command `python server.py`, health check `/healthz`). Remove the old disk/`NAV_DB_PATH` if you had one. `render.yaml` is an untested reference.
+4. Optional: `PASTEFY_API_TOKEN=… PASTEFY_PASTE_ID=… python tests/live_pastefy_smoke.py [--write]` verifies the real Pastefy contract from your machine.
+5. In the script: *Memory token* = one of `NAV_TOKENS` (URL defaults to `https://memoryhades.onrender.com`).
+6. Optional UptimeRobot on `/healthz` (5 min) keeps a free instance awake but uses instance-hours; it is a monitor, not a guarantee.
+Old SQLite data is **not migrated** (no tool written); the clients' local memory is unaffected and rebuilds the shared memory over time.
+
+## 9. Test status — simulated vs real
+| What | How | Result |
+|---|---|---|
+| Backend logic, Pastefy transport, failure paths (outage, 429, 5xx, junk, corruption, restart, merge, caching, token secrecy) | `tests/test_backend.py` against `tests/fake_pastefy.py` (**simulated** Pastefy built from docs.pastefy.app) | 79/79 |
+| Lua memory (persistence, offline, recovery, corruption, one-in-flight, duplicates, back-off, cache) | `../tests/lua/mem_tests.lua` on a **real Luau interpreter** with **simulated** Roblox/executor/Render stubs | 47/47 |
+| Farm Additional tab / Auto Farm tab | `../tests/lua/ui_tests.lua`: the real UI code run against a **recording stand-in** for AdminUI | 15/15 |
+| Static: compiles in real Luau (local/upvalue limits), unchanged regions, no Pastefy secrets in Lua, library methods exist | `../tests/static_checks.py` | 14/14 |
+| Client ↔ server wire contract | `../tests/contract_test.py` (real Lua client code + real `server.py`) | 8/8 |
+| **Real Pastefy API** | not run (no token); `tests/live_pastefy_smoke.py` provided | **untested** |
+| **Real Render deployment** | not deployed | **untested** |
+| **Roblox / an executor / real AdminUI rendering** | not run | **untested** |
+Unverified assumptions about Pastefy: the exact GET JSON shape (both wrapped `{"paste":{…}}` and flat are accepted), that `PUT {"content":…}` alone updates content without touching other fields (read-back verification flags it if not), size limits, and the real rate limits.
