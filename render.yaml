@@ -1,18 +1,18 @@
-# UNTESTED template for option A (paid web service + persistent disk). Verify against Render's Blueprint spec before use.
+# UNTESTED reference (I could not deploy to Render). Your service already exists (memoryhades): you do NOT need a Blueprint.
+# Simply deploy the new server.py to it and set the environment variables below in the Render dashboard.
+# No persistent disk is needed any more: Pastefy is the persistent store, so the free plan works.
 services:
   - type: web
-    name: coinfarm-nav-memory
+    name: memoryhades
     runtime: python
-    plan: starter            # a paid plan: persistent disks are not available on free instances
+    plan: free
     buildCommand: python --version
     startCommand: python server.py
-    healthCheckPath: /healthz
-    disk:
-      name: nav-data
-      mountPath: /var/data
-      sizeGB: 1
+    healthCheckPath: /healthz        # always 200 while the process runs, even if Pastefy is down (see README)
     envVars:
-      - key: NAV_DB_PATH
-        value: /var/data/nav.sqlite3
-      - key: NAV_TOKENS
-        sync: false          # set in the dashboard, never commit it
+      - key: PASTEFY_API_TOKEN       # from https://pastefy.app/apikeys - set in the dashboard, never commit it
+        sync: false
+      - key: PASTEFY_PASTE_ID        # id of the ONE designated paste (the part after pastefy.app/)
+        sync: false
+      - key: NAV_TOKENS              # comma separated secrets the Lua script sends as "Memory token"
+        sync: false
